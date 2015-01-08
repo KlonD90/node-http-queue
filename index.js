@@ -4,7 +4,7 @@ var _ = require('underscore');
 
 var E = {};
 
-var defaultOptions = {
+var defaultSettings = {
     delayQueueCheck: 500,
     delayProcessedCheck: 1000,
     channelSuffix: '_default',
@@ -52,183 +52,231 @@ function createRealtimeAdapterQueue(opts){
     adapter.prototype.pullTask = opts.pullTask;
     adapter.prototype.pushTask = opts.pushTask;
     adapter.prototype.listen = opts.listen;
-    adapter.prototype.init = opts.init;
+    adapter.prototype.initAgent = opts.initAgent;
+    adapter.prototype.initWorker = opts.initWorker;
+    return adapter;
 }
 
-var RealtimeRedisAdapterQueue = createRealtimeAdapterQueue({
-    initAgent: function(opts){
-        var channel = 'agent_channel_'+this.channelName+'_'+process.pid;
-        this.client = require('redis').createClient(opts);
-        this.client.on('message', function(ch, message){
-            if (channel === ch)
-            {
-                var info = JSON.parse(message);
-                resolveTask(info.data);
-                pool.info
-            }
-        });
-        this.client.subscribe('agent_channel_'+this.channelName);
-        this.idPool = new IdPool();
-        this.pool = {};
+function QueueAgentAdapter(opts){
+    var adapter = function(channelName){
+        this.channelName = channelName;
+    };
+    adapter.prototype.pullTask = opts.pullTask;
+    adapter.prototype.resolveTask = opts.resolveTask;
+    adapter.prototype.init = opts.init;
+    return adapter;
+}
 
-    },
-    initWorker: function(opts){
-        this.client = require('redis').createClient(opts);
-        var channel = 'workers_channel_'+this.channelName;
-        this.client.on('message', function(ch){
-            if (ch==channel)
-            {
-                accquireTask();
-            }
-            //var item = pgFreeClient.getClient();
-            //logger.log(item);
-            //if (item){
-            //    redisClient.lpop(LibRecom.job_queue_name, function(err, reply){
-            //        if (reply)
-            //        {
-            //            do_work(reply, item);
-            //        }
-            //        else
-            //        {
-            //            item.done();
-            //        }
-            //    });
-            //}
-        });
-        this.client.subscribe(channel);
-    },
-    pullTask: function(){
-        var dfd = vow.defer();
-        var queueName = 'workers_channel_'+this.channelName;
-        this.client.lpop(queueName, function(err, reply){
-            if (err)
-            {
-                return void dfd.reject(err);
-            }
-            if (reply)
-            {
-                var info = JSON.parse(reply);
-                dfd.resolve([info.data, info]);
-            }
-            else
-            {
-                dfd.resolve();
-            }
-        });
-        return dfd.promise();
-    },
-    resolveTask: function(message, info){
-        var dfd = vow.defer();
-        info.data = message;
-        this.client.publish('agent_channel_'+this.channelName+'_'+info.submitter, JSON.parse(info));
-        dfd.resolve();
-        return dfd.promise();
-    },
-    pushTask: function(message){
-        var self = this;
-        var conId = this.idPool.get();
-        this.pool[conId.value()] = {
-            resource: resource,
-            con_id: conId,
-            timeout: false
-        };
-        var info = {
-            submitter: this.channelName + process.pid,
-            con_id: conId.value(),
-            data: message
-        };
-        this.client.rpush('workers_queue_'+this.channelName, JSON.stringify(info));
-        this.client.publish('workers_channel_'+this.channelName, '1');
-        this.pool[conId.value()].timeout = setTimeout(function(){
-            if (!this.pool[conId.value()])
-                return;
-            if (+reply)
-            {
-                self.pool[conId.value()] = false;
-                conId.release();
-                self.queueCheckFallback(resource);
-            }
-            else
-            {
-                self.pool[conId.value()].timeout = setTimeout(function(){
-                    if (!pool[conId.value()])
+function QueueWorkerAdapter(opts){
+    var adapter = function(channelName){
+        this.channelName = channelName;
+    };
+    adapter.prototype.pushTask = opts.pushTask;
+    adapter.prototype.resolveTask = opts.resolveTask;
+    adapter.prototype.init = opts.init;
+    return adapter;
+}
+
+function QueueRedisAgentAdapter(redisOpts, resolveTask, settings){
+    settings = _.extend(defaultSettings, settings);
+    var opts = {
+        init: function(cb){
+            var channel = 'agent_channel_'+this.channelName+'_'+process.pid;
+            this.client = require('redis').createClient(redisOpts);
+            this.client.on('message', function(ch, message){
+                if (channel === ch)
+                {
+                    var info = JSON.parse(message);
+                    var item = this.pool[info.con_id];
+                    if (!item || info.timestamp != item.timestamp)
                         return;
+                    item.con_id.release();
+                    clearTimeout(conId.timeout);
+                    resolveTask(item.response, info.data);
+                }
+            });
+            this.client.subscribe('agent_channel_'+this.channelName);
+            this.idPool = new IdPool();
+            this.pool = {};
+            cb();
+        },
+        pushTask: function(response, message){
+            var self = this;
+            var conId = this.idPool.get();
+            var timestamp = Date.now();
+            this.pool[conId.value()] = {
+                response: response,
+                con_id: conId,
+                timeout: false,
+                timestamp: timestamp
+            };
+            var info = {
+                submitter: this.channelName + process.pid,
+                con_id: conId.value(),
+                data: message,
+                timestamp: timestamp
+            };
+            var jsonValue = JSON.stringify(info);
+            this.client.rpush('workers_queue_'+this.channelName, jsonValue);
+            this.client.publish('workers_channel_'+this.channelName, '1');
+            this.pool[conId.value()].timeout = setTimeout(function(){
+                if (!this.pool[conId.value()] || this.pool[conId.value()].timestamp != timestamp)
+                    return;
+                redisClient.lrem('workers_queue_'+this.channelName, 1, jsonValue, function(err, reply) {
+                    if (+reply) {
+                        self.pool[conId.value()] = false;
+                        conId.release();
+                        settings.queueCheckFallback(response);
+                    }
+                    else {
+                        self.pool[conId.value()].timeout = setTimeout(function () {
+                            if (!self.pool[conId.value()])
+                                return;
+                            self.pool[conId.value()] = false;
+                            conId.release();
+                            settings.timeoutFallback(response);
+                        }, settings.delayProcessedCheck);
+                    }
+                });
+            }, settings.delayQueueCheck);
+        }
+    };
+    return QueueAgentAdapter(opts);
+}
+
+function QueueRedisWorkerAdapter(redisOpts, resolveTask){
+    var opts = {
+        init: function(cb){
+            this.client = require('redis').createClient(opts);
+            var channel = 'workers_channel_'+this.channelName;
+            this.client.on('message', function(ch){
+                if (ch==channel)
+                {
+                    accquireTask();
+                }
+            });
+            this.client.subscribe(channel);
+            cb();
+        },
+        pullTask: function(cb){
+            var queueName = 'workers_channel_'+this.channelName;
+            this.client.lpop(queueName, function(err, reply){
+                if (err)
+                {
+                    return void cb(err);
+                }
+                if (reply)
+                {
+                    var info = JSON.parse(reply);
+                    cb(null, [info.data, info]);
+                }
+                else
+                {
+                    cb(null);
+                }
+            });
+        }
+    };
+    return QueueWorkerAdapter(opts);
+}
+
+function RealtimeRedisAdapterQueue(accquireTask, resolveTask){
+    return createRealtimeAdapterQueue({
+        initAgent: function(opts, cb){
+            var channel = 'agent_channel_'+this.channelName+'_'+process.pid;
+            this.client = require('redis').createClient(opts);
+            this.client.on('message', function(ch, message){
+                if (channel === ch)
+                {
+                    var info = JSON.parse(message);
+                    var item = this.pool[info.con_id];
+                    if (!item || info.timestamp != item.timestamp)
+                        return;
+                    item.con_id.release();
+                    clearTimeout(conId.timeout);
+                    resolveTask(item.response, info.data);
+                }
+            });
+            this.client.subscribe('agent_channel_'+this.channelName);
+            this.idPool = new IdPool();
+            this.pool = {};
+            cb();
+        },
+        initWorker: function(opts, cb){
+            this.client = require('redis').createClient(opts);
+            var channel = 'workers_channel_'+this.channelName;
+            this.client.on('message', function(ch){
+                if (ch==channel)
+                {
+                    accquireTask();
+                }
+            });
+            this.client.subscribe(channel);
+            cb();
+        },
+        pullTask: function(cb){
+            //var dfd = vow.defer();
+            var queueName = 'workers_channel_'+this.channelName;
+            this.client.lpop(queueName, function(err, reply){
+                if (err)
+                {
+                    return void cb(err);
+                }
+                if (reply)
+                {
+                    var info = JSON.parse(reply);
+                    cb(null, [info.data, info]);
+                }
+                else
+                {
+                    cb(null);
+                }
+            });
+        },
+        workerResolveTask: function(message, info, cb){
+            info.data = message;
+            this.client.publish('agent_channel_'+this.channelName+'_'+info.submitter, JSON.parse(info));
+            cb();
+        },
+        pushTask: function(response, message){
+            var self = this;
+            var conId = this.idPool.get();
+            this.pool[conId.value()] = {
+                response: response,
+                con_id: conId,
+                timeout: false
+            };
+            var info = {
+                submitter: this.channelName + process.pid,
+                con_id: conId.value(),
+                data: message
+            };
+            this.client.rpush('workers_queue_'+this.channelName, JSON.stringify(info));
+            this.client.publish('workers_channel_'+this.channelName, '1');
+            this.pool[conId.value()].timeout = setTimeout(function(){
+                if (!this.pool[conId.value()])
+                    return;
+                if (+reply)
+                {
                     self.pool[conId.value()] = false;
                     conId.release();
-                    self.timeoutFallback(resource);
-                }, opt.delayProcessedCheck);
-            }
-        }, opt.delayQueueCheck);
-    }
-});
-
-
-RealtimeAgent.prototype.pushMessage = function(options){
-    var pool = {};
-    var opt = _.extend(E.options, options);
-    opt.redisClient = opt.redisClient || redis.createClient();
-    opt.redisClient.on('message', function(channel, message){
-        var info = JSON.parse(message);
-        if (pool[info.con_id]){
-            var item = pool[info.con_id];
-            item.con_id.release();
-            if (item.timeout)
-                clearTimeout(item.timeout);
-            pool[item.con_id.value()] = false;
-            opt.successCallback(item.resource, info.data);
+                    self.queueCheckFallback(resource);
+                }
+                else
+                {
+                    self.pool[conId.value()].timeout = setTimeout(function(){
+                        if (!pool[conId.value()])
+                            return;
+                        self.pool[conId.value()] = false;
+                        conId.release();
+                        self.timeoutFallback(resource);
+                    }, opt.delayProcessedCheck);
+                }
+            }, opt.delayQueueCheck);
         }
     });
-    opt.redisClient.subscribe('front'+opt.channelSuffix);
-    return E.sendMessage(opt, pool);
-};
+}
 
-E.createWorker = function(options){
-    var opt = _.extend(E.options, options);
-    opt.redisClient = opt.redisClient || redis.createClient();
-    return function(){
-
-    };
-};
-
-
-E.sendMessage = function(opt, pool)
-{
-    return function(resource, message){
-        var conId = pool.get();
-        pool[conId.value()] = {
-            con_id: conId,
-            timeout: false
-        };
-        var info = {
-            worker: process.pid + opt.channelSuffix,
-            con_id: conId.value(),
-            data: message
-        };
-        opt.redisClient.rpush('workers_queue'+opt.channelSuffix, JSON.stringify(info));
-        opt.redisClient.publish('workers_channel'+opt.channelSuffix, 'more');
-        pool[conId.value()].timeout = setTimeout(function(){
-            if (!pool[conId.value()])
-                return;
-            if (+reply)
-            {
-                pool[conId.value()] = false;
-                conId.release();
-                opt.queueCheckFallback(resource);
-            }
-            else
-            {
-                pool[conId.value()].timeout = setTimeout(function(){
-                    if (!pool[conId.value()])
-                        return;
-                    pool[conId.value()] = false;
-                    conId.release();
-                    opt.timeoutFallback(resource);
-                }, opt.delayProcessedCheck);
-            }
-        }, opt.delayQueueCheck);
-    }
-};
-
-E.processRequest()
+E.createRedisRealtimeAdapterQueue = RealtimeRedisAdapterQueue;
 
 module.exports = E;
